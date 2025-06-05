@@ -10,6 +10,11 @@ ShopSalesJA is an online marketplace and directory that highlights the best Jama
 
 Visit the live site here: [https://shopsalesja.com](https://shopsalesja.com)
 
+https://shopsalesja.com/products/Where-to-Buy-Gift-Cards-in-Jamaica-Local-And-Online-Options-c182867251
+
+https://shopsalesja.com/products/Ultrasonic-Anti-Bark-Device-Safe-Effective-Dog-Bark-Deterrent-Jamaica-p755135859
+
+https://shopsalesja.com/products/Ultimate-SEO-Checklist-PDF-Boost-Traffic-Authority-And-Sales-Jamaica-p755763687
 ## Features
 
 - Curated listings of Jamaican online stores
