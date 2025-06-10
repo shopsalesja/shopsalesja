@@ -9,6 +9,7 @@ ShopSalesJA is an online marketplace and directory that highlights the best Jama
 ## Website
 
 Visit the live site here: [https://shopsalesja.com](https://shopsalesja.com)
+https://shopsalesja.com/write-for-us
 
 https://shopsalesja.com/products/Where-to-Buy-Gift-Cards-in-Jamaica-Local-And-Online-Options-c182867251
 
