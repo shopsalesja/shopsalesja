@@ -12,7 +12,9 @@ Visit the live site here: [https://shopsalesja.com](https://shopsalesja.com)
 https://shopsalesja.com/write-for-us
 
 https://shopsalesja.com/products/Where-to-Buy-Gift-Cards-in-Jamaica-Local-And-Online-Options-c182867251
+https://blogmaster.shopsalesja.com/add-ads-txt-to-ecwid-without-root-access
 
+https://blogmaster.shopsalesja.com
 https://shopsalesja.com/products/Mens-Vintage-Suede-Moc-Toe-Boat-Loafers-Slip-On-Comfort-Walking-Shoes-p772747020
 
 https://shopsalesja.com/products/Dynamic-Jellyfish-Aroma-Diffuser-Air-Humidifier-For-Sale-In-Jamaica-p764808336
