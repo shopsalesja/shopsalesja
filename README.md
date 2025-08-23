@@ -16,6 +16,8 @@ https://blogmaster.shopsalesja.com/add-ads-txt-to-ecwid-without-root-access
 https://blogmaster.shopsalesja.com/ai-text-generator-usa-2025
 https://blogmaster.shopsalesja.com/ai-marketing-tools-usa
 https://blogmaster.shopsalesja.com/home-office-tech-small-business-2025
+https://shopsalesja.com/products/Electric-Heated-Lunch-Box-3L-Portable-Food-Warmer-p754847341
+https://shopsalesja.company.site/products/Blog-Master-Guides-On-AI-And-Business-Growth-c187490272
 https://blogmaster.shopsalesja.com
 https://shopsalesja.com/products/Mens-Vintage-Suede-Moc-Toe-Boat-Loafers-Slip-On-Comfort-Walking-Shoes-p772747020
 
