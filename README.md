@@ -11,6 +11,7 @@ ShopSalesJA is an online marketplace and directory that highlights the best Jama
 Visit the live site here: [https://shopsalesja.com](https://shopsalesja.com)
 https://shopsalesja.com/write-for-us
 
+https://linkmysite.app
 https://shopsalesja.com/products/Where-to-Buy-Gift-Cards-in-Jamaica-Local-And-Online-Options-c182867251
 https://blogmaster.shopsalesja.com/future-of-domain-names-2025
 https://blogmaster.shopsalesja.com/add-ads-txt-to-ecwid-without-root-access
