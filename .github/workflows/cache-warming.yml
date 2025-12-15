@@ -1,0 +1,275 @@
+name: Sitemap Cache Warming
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'  # Every 2 hours
+  workflow_dispatch:  # Manual trigger button
+
+jobs:
+  warm-cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout (optional, useful for logs)
+        uses: actions/checkout@v4
+
+      - name: Load previous state
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: warming-state
+          path: warming-state
+
+      - name: Fetch and warm entire sitemap
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          SITEMAP_URL="https://shopsalesja.com/sitemap.xml"
+          MAX_URLS_PER_RUN=5
+          FRESHNESS_DAYS=60
+          STATE_DIR="warming-state"
+          STATE_FILE="$STATE_DIR/warming-state.txt"
+          TEMP_SITEMAP="sitemap.tmp.xml"
+
+          mkdir -p "$STATE_DIR"
+
+          echo "🔥 Starting sitemap cache warming..."
+          echo ""
+
+          # Download sitemap
+          echo "📡 Fetching sitemap from $SITEMAP_URL..."
+          curl -sL "$SITEMAP_URL" -o "$TEMP_SITEMAP" || {
+            echo "❌ Failed to download sitemap"
+            exit 1
+          }
+
+          # Parse sitemap: extract <loc> and optional <priority>, include if no priority or priority >= 0.5
+          URLS=$(awk 'BEGIN { RS="</url>"; IGNORECASE=1 }
+            {
+              if (match($0, /<loc>[^<]+<\/loc>/)) {
+                loc = substr($0, RSTART+5, RLENGTH-11)
+              } else {
+                loc = ""
+              }
+              if (match($0, /<priority>[^<]+<\/priority>/)) {
+                pri = substr($0, RSTART+10, RLENGTH-20)
+              } else {
+                pri = ""
+              }
+              if (loc != "") {
+                # skip common asset extensions
+                if (loc ~ /\.(xml|jpg|jpeg|png|gif|webp|css|js|pdf)$/i) next
+                if (pri == "" || (pri + 0) >= 0.5) print loc
+              }
+            }' "$TEMP_SITEMAP" || true)
+
+          # Normalize CRLF and remove empty lines
+          URLS=$(echo "$URLS" | tr -d '\r' | sed '/^\s*$/d' || true)
+
+          # 🔥 Normalize URLs to lowercase paths (align with Worker canonicalization)
+          # This lowercases only the path portion, preserving query strings and fragments.
+          URLS=$(echo "$URLS" | awk '
+          {
+            line = $0
+            # if no "://" present, just print original
+            if (index(line, "://") == 0) { print line; next }
+            split(line, protoSplit, "://")
+            proto = protoSplit[1]
+            rest = protoSplit[2]
+
+            # Extract host (up to first "/") and remainder
+            host = rest
+            pathAndAfter = ""
+            slashPos = index(rest, "/")
+            if (slashPos > 0) {
+              host = substr(rest, 1, slashPos-1)
+              pathAndAfter = substr(rest, slashPos)  # includes leading "/"
+            }
+
+            if (pathAndAfter == "") {
+              # no path; print as-is (host only)
+              print proto "://" host
+              next
+            }
+
+            # Separate path from query/fragment
+            qPos = index(pathAndAfter, "?")
+            hPos = index(pathAndAfter, "#")
+            sepPos = 0
+            if (qPos > 0 && hPos > 0) {
+              sepPos = (qPos < hPos ? qPos : hPos)
+            } else if (qPos > 0) {
+              sepPos = qPos
+            } else if (hPos > 0) {
+              sepPos = hPos
+            }
+
+            if (sepPos > 0) {
+              pathOnly = substr(pathAndAfter, 1, sepPos-1)
+              tail = substr(pathAndAfter, sepPos)
+            } else {
+              pathOnly = pathAndAfter
+              tail = ""
+            }
+
+            # Lowercase each path segment
+            split(pathOnly, segs, "/")
+            newPath = ""
+            for (i = 1; i <= length(segs); i++) {
+              seg = segs[i]
+              # preserve empty segments (leading slash)
+              if (i == 1) {
+                newPath = (seg == "" ? "/" : "/" tolower(seg))
+              } else {
+                newPath = newPath "/" tolower(seg)
+              }
+            }
+
+            # Avoid double slashes produced above when pathOnly == "/"
+            gsub(/\/+/, "/", newPath)
+
+            print proto "://" host newPath tail
+          }' || true)
+
+          if [ -z "$URLS" ]; then
+            echo "⚠️  No URLs found in sitemap (or filtered out). Exiting."
+            exit 0
+          fi
+
+          TOTAL_URLS=$(echo "$URLS" | wc -l | tr -d ' ')
+          echo "📋 Found $TOTAL_URLS URLs in sitemap (after filtering)"
+          echo ""
+
+          # Load state from previous run (expects warming-state/warming-state.txt if artifact existed)
+          if [ -f "$STATE_FILE" ]; then
+            CURRENT_INDEX=$(cat "$STATE_FILE" | tr -d '\r\n' || echo "0")
+            if ! [[ "$CURRENT_INDEX" =~ ^[0-9]+$ ]]; then
+              echo "⚠️  Invalid state value in $STATE_FILE; resetting to 0"
+              CURRENT_INDEX=0
+            else
+              echo "📍 Resuming from index $CURRENT_INDEX"
+            fi
+          else
+            CURRENT_INDEX=0
+            echo "🆕 Starting new warming cycle"
+          fi
+          echo ""
+
+          # Guard: if CURRENT_INDEX >= TOTAL_URLS reset to 0
+          if [ "$CURRENT_INDEX" -ge "$TOTAL_URLS" ]; then
+            echo "🔄 Saved index beyond total URLs; resetting to 0"
+            CURRENT_INDEX=0
+          fi
+
+          # Select batch of URLs
+          # tail -n +N starts from line N (1-based)
+          START_LINE=$((CURRENT_INDEX + 1))
+          BATCH_URLS=$(echo "$URLS" | tail -n +"$START_LINE" | head -n "$MAX_URLS_PER_RUN" || true)
+          BATCH_COUNT=$(echo "$BATCH_URLS" | sed '/^\s*$/d' | wc -l | tr -d ' ')
+
+          if [ -z "$BATCH_URLS" ] || [ "$BATCH_COUNT" -eq 0 ]; then
+            echo "🔄 Reached end of sitemap or no batch available, restarting from beginning"
+            CURRENT_INDEX=0
+            START_LINE=1
+            BATCH_URLS=$(echo "$URLS" | head -n "$MAX_URLS_PER_RUN")
+            BATCH_COUNT=$(echo "$BATCH_URLS" | sed '/^\s*$/d' | wc -l | tr -d ' ')
+          fi
+
+          echo "📦 Processing batch: URLs $START_LINE to $((CURRENT_INDEX + BATCH_COUNT)) of $TOTAL_URLS"
+          echo ""
+
+          # Warm loop
+          WARMED=0
+          SKIPPED=0
+          FAILED=0
+          INDEX=0
+
+          # Precompute freshness threshold in seconds
+          FRESHNESS_THRESHOLD=$((FRESHNESS_DAYS * 86400))
+
+          while IFS= read -r url; do
+            url=$(echo "$url" | tr -d '\r')
+            INDEX=$((INDEX + 1))
+            echo "[$INDEX/$BATCH_COUNT] Checking: $url"
+
+            # HEAD request follow redirects
+            RESPONSE=$(curl -sI -L -w "\n%{http_code}" "$url" 2>/dev/null || echo -e "\n000")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1 | tr -d '\r')
+            HEADERS=$(echo "$RESPONSE" | sed '$d' || true)
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "  ⚠️  Got HTTP $HTTP_CODE - skipping"
+              FAILED=$((FAILED + 1))
+              echo ""
+              continue
+            fi
+
+            # Extract Age and CF-Cache-Status from headers (case-insensitive)
+            AGE=$(echo "$HEADERS" | awk 'BEGIN{IGNORECASE=1} /^age:/{print $2; exit}' | tr -d '\r' || echo "0")
+            CACHE_STATUS=$(echo "$HEADERS" | awk 'BEGIN{IGNORECASE=1} /^cf-cache-status:/{print $2; exit}' | tr -d '\r' || echo "MISS")
+
+            # Normalize AGE to integer seconds
+            if ! [[ "$AGE" =~ ^[0-9]+$ ]]; then AGE=0; fi
+
+            AGE_DAYS=$((AGE / 86400))
+
+            # Skip if fresh
+            if [ "${CACHE_STATUS^^}" = "HIT" ] && [ "$AGE" -lt "$FRESHNESS_THRESHOLD" ]; then
+              echo "  ⏭️  Skipping (edge HIT, ${AGE_DAYS}d old)"
+              SKIPPED=$((SKIPPED + 1))
+              echo ""
+              continue
+            fi
+
+            # Warm the URL
+            echo "  🔥 Warming ($CACHE_STATUS, ${AGE_DAYS}d old)..."
+
+            WARM_RESPONSE=$(curl -sL \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              -w "\n%{http_code}" \
+              "$url" 2>/dev/null || echo -e "\n000")
+
+            WARM_CODE=$(echo "$WARM_RESPONSE" | tail -n1 | tr -d '\r')
+
+            if [ "$WARM_CODE" = "200" ]; then
+              echo "  ✅ Warmed successfully"
+              WARMED=$((WARMED + 1))
+            else
+              echo "  ❌ Failed (HTTP $WARM_CODE)"
+              FAILED=$((FAILED + 1))
+            fi
+
+            echo ""
+            sleep 2  # Delay between requests
+          done <<< "$BATCH_URLS"
+
+          # Update state for next run
+          NEXT_INDEX=$((CURRENT_INDEX + BATCH_COUNT))
+
+          if [ "$NEXT_INDEX" -ge "$TOTAL_URLS" ]; then
+            echo "🔄 Completed full cycle, restarting"
+            NEXT_INDEX=0
+          fi
+
+          echo "$NEXT_INDEX" > "$STATE_FILE"
+
+          echo ""
+          echo "📊 Results:"
+          echo "   ✅ Warmed: $WARMED"
+          echo "   ⏭️  Skipped: $SKIPPED"
+          echo "   ❌ Failed: $FAILED"
+          echo ""
+          echo "📍 Next run will start from index $NEXT_INDEX of $TOTAL_URLS"
+          echo ""
+          echo "✅ Cache warming complete!"
+      - name: Save state for next run
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: warming-state
+          path: warming-state
+          retention-days: 7
