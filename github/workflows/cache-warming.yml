@@ -1,0 +1,154 @@
+name: Sitemap Cache Warming
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'  # Every 20 minutes
+  workflow_dispatch:  # Manual trigger button
+
+jobs:
+  warm-cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Fetch and warm entire sitemap
+        run: |
+          #!/bin/bash
+          set -e
+          
+          SITEMAP_URL="https://shopsalesja.com/sitemap.xml"
+          MAX_URLS_PER_RUN=8
+          FRESHNESS_DAYS=60
+          STATE_FILE="warming-state.txt"
+          
+          echo "🔥 Starting sitemap cache warming..."
+          echo ""
+          
+          # Download sitemap
+          echo "📡 Fetching sitemap from $SITEMAP_URL..."
+          SITEMAP=$(curl -sL "$SITEMAP_URL")
+          
+          # Extract URLs with priority >= 0.5
+          URLS=$(echo "$SITEMAP" | grep -oP '(?<=<loc>)[^<]+' | grep -v '\.(xml|jpg|png|gif|webp|css|js|pdf)$' || true)
+          TOTAL_URLS=$(echo "$URLS" | wc -l)
+          
+          echo "📋 Found $TOTAL_URLS URLs in sitemap"
+          echo ""
+          
+          # Load state from previous run
+          if [ -f "$STATE_FILE" ]; then
+            CURRENT_INDEX=$(cat "$STATE_FILE")
+            echo "📍 Resuming from index $CURRENT_INDEX"
+          else
+            CURRENT_INDEX=0
+            echo "🆕 Starting new warming cycle"
+          fi
+          echo ""
+          
+          # Select batch of URLs
+          BATCH_URLS=$(echo "$URLS" | tail -n +$((CURRENT_INDEX + 1)) | head -n $MAX_URLS_PER_RUN)
+          BATCH_COUNT=$(echo "$BATCH_URLS" | wc -l)
+          
+          if [ -z "$BATCH_URLS" ] || [ "$BATCH_COUNT" -eq 0 ]; then
+            echo "🔄 Reached end of sitemap, restarting from beginning"
+            CURRENT_INDEX=0
+            BATCH_URLS=$(echo "$URLS" | head -n $MAX_URLS_PER_RUN)
+            BATCH_COUNT=$(echo "$BATCH_URLS" | wc -l)
+          fi
+          
+          echo "📦 Processing batch: URLs $((CURRENT_INDEX + 1)) to $((CURRENT_INDEX + BATCH_COUNT)) of $TOTAL_URLS"
+          echo ""
+          
+          # Check and warm URLs
+          WARMED=0
+          SKIPPED=0
+          FAILED=0
+          INDEX=0
+          
+          while IFS= read -r url; do
+            INDEX=$((INDEX + 1))
+            echo "[$INDEX/$BATCH_COUNT] Checking: $url"
+            
+            # Check cache status with HEAD request
+            RESPONSE=$(curl -sI -L -w "\n%{http_code}" "$url" 2>/dev/null || echo "000")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            HEADERS=$(echo "$RESPONSE" | head -n -1)
+            
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "  ⚠️  Got HTTP $HTTP_CODE - skipping"
+              FAILED=$((FAILED + 1))
+              echo ""
+              continue
+            fi
+            
+            AGE=$(echo "$HEADERS" | grep -i "^age:" | awk '{print $2}' | tr -d '\r' || echo "0")
+            CACHE_STATUS=$(echo "$HEADERS" | grep -i "^cf-cache-status:" | awk '{print $2}' | tr -d '\r' || echo "MISS")
+            
+            AGE_DAYS=$((AGE / 86400))
+            FRESHNESS_THRESHOLD=$((FRESHNESS_DAYS * 86400))
+            
+            # Skip if fresh
+            if [ "$CACHE_STATUS" = "HIT" ] && [ "$AGE" -lt "$FRESHNESS_THRESHOLD" ]; then
+              echo "  ⏭️  Skipping (edge HIT, ${AGE_DAYS}d old)"
+              SKIPPED=$((SKIPPED + 1))
+              echo ""
+              continue
+            fi
+            
+            # Warm the URL
+            echo "  🔥 Warming ($CACHE_STATUS, ${AGE_DAYS}d old)..."
+            
+            WARM_RESPONSE=$(curl -sL \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              -w "\n%{http_code}" \
+              "$url" 2>/dev/null || echo "000")
+            
+            WARM_CODE=$(echo "$WARM_RESPONSE" | tail -n1)
+            
+            if [ "$WARM_CODE" = "200" ]; then
+              echo "  ✅ Warmed successfully"
+              WARMED=$((WARMED + 1))
+            else
+              echo "  ❌ Failed (HTTP $WARM_CODE)"
+              FAILED=$((FAILED + 1))
+            fi
+            
+            echo ""
+            sleep 2  # Delay between requests
+          done <<< "$BATCH_URLS"
+          
+          # Update state for next run
+          NEXT_INDEX=$((CURRENT_INDEX + BATCH_COUNT))
+          
+          if [ "$NEXT_INDEX" -ge "$TOTAL_URLS" ]; then
+            echo "🔄 Completed full cycle, restarting"
+            NEXT_INDEX=0
+          fi
+          
+          echo "$NEXT_INDEX" > "$STATE_FILE"
+          
+          echo ""
+          echo "📊 Results:"
+          echo "   ✅ Warmed: $WARMED"
+          echo "   ⏭️  Skipped: $SKIPPED"
+          echo "   ❌ Failed: $FAILED"
+          echo ""
+          echo "📍 Next run will start from index $NEXT_INDEX of $TOTAL_URLS"
+          echo ""
+          echo "✅ Cache warming complete!"
+      
+      - name: Save state for next run
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: warming-state
+          path: warming-state.txt
+          retention-days: 7
+      
+      - name: Load previous state
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: warming-state
