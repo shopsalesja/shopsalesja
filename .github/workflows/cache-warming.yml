@@ -27,7 +27,7 @@ jobs:
           set -euo pipefail
 
           SITEMAP_URL="https://shopsalesja.com/sitemap.xml"
-          MAX_URLS_PER_RUN=5
+          MAX_URLS_PER_RUN=20
           FRESHNESS_DAYS=60
           STATE_DIR="warming-state"
           STATE_FILE="$STATE_DIR/warming-state.txt"
@@ -50,28 +50,50 @@ jobs:
             exit 1
           }
 
-          # Parse sitemap: extract <loc> and optional <priority>, include if no priority or priority >= 0.5
-          URLS=$(awk 'BEGIN { RS="</url>"; IGNORECASE=1 }
-            {
-              if (match($0, /<loc>[^<]+<\/loc>/)) {
-                loc = substr($0, RSTART+5, RLENGTH-11)
-              } else {
-                loc = ""
-              }
-              if (match($0, /<priority>[^<]+<\/priority>/)) {
-                pri = substr($0, RSTART+10, RLENGTH-20)
-              } else {
-                pri = ""
-              }
-              if (loc != "") {
-                # skip common asset extensions
-                if (loc ~ /\.(xml|jpg|jpeg|png|gif|webp|css|js|pdf)$/i) next
-                if (pri == "" || (pri + 0) >= 0.5) print loc
-              }
-            }' "$TEMP_SITEMAP" || true)
+          # Debug: show head of sitemap to help troubleshooting
+          echo "---- sitemap.tmp.xml head ----"
+          head -n 40 "$TEMP_SITEMAP" | sed 's/^/    /'
+          echo "---- end head ----"
+          echo ""
 
-          # Normalize CRLF and remove empty lines
-          URLS=$(echo "$URLS" | tr -d '\r' | sed '/^\s*$/d' || true)
+          # Aggregate <loc> entries. Handle sitemapindex (child .xml sitemaps) by fetching them.
+          LOCS_TOP="$(mktemp)"
+          AGG="$(mktemp)"
+          # Extract locs from top-level sitemap
+          sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' "$TEMP_SITEMAP" > "$LOCS_TOP" || true
+
+          # If there are child sitemap .xml links, fetch them and aggregate their <loc>s
+          if grep -qiE '\.xml$' "$LOCS_TOP"; then
+            echo "🔁 Found child sitemap(s); fetching and aggregating..."
+            while IFS= read -r sm; do
+              # skip empty lines
+              [ -z "${sm// }" ] && continue
+              if echo "$sm" | grep -qiE '\.xml$'; then
+                echo "  ↳ fetching $sm"
+                child_tmp="$(mktemp)"
+                if curl -sL "$sm" -o "$child_tmp"; then
+                  sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' "$child_tmp" >> "$AGG" || true
+                else
+                  echo "    ⚠️  Failed to fetch child sitemap $sm"
+                fi
+                rm -f "$child_tmp"
+              fi
+            done < "$LOCS_TOP"
+            # Also add any non-xml locs that might be present in the top-level (rare)
+            grep -viE '\.xml$' "$LOCS_TOP" >> "$AGG" || true
+          else
+            # No child sitemaps: use the locs from the one file
+            cat "$LOCS_TOP" >> "$AGG" || true
+          fi
+
+          # Prepare final URL list: normalize line endings and remove blanks
+          URLS=$(cat "$AGG" | tr -d '\r' | sed '/^\s*$/d' || true)
+
+          # Cleanup temp files
+          rm -f "$LOCS_TOP" "$AGG" || true
+
+          # Filter out typical asset extensions (images, css, js, pdf) but keep page HTML URLs
+          URLS=$(echo "$URLS" | grep -viE '\.(xml|jpg|jpeg|png|gif|webp|css|js|pdf)$' || true)
 
           # Normalize URLs to lowercase paths (align with Worker canonicalization)
           URLS=$(echo "$URLS" | awk '
