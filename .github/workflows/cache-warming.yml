@@ -13,6 +13,8 @@ jobs:
   warm-cache:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CF_ALLOWED_TOKEN: ${{ secrets.CF_ALLOWED_TOKEN }}
 
     steps:
       - name: Checkout (needed so we can read/write the state file)
@@ -43,9 +45,9 @@ jobs:
           echo "🔥 Starting sitemap cache warming..."
           echo ""
 
-          # Download sitemap
+          # Download sitemap (include bypass header)
           echo "📡 Fetching sitemap from $SITEMAP_URL..."
-          curl -sL "$SITEMAP_URL" -o "$TEMP_SITEMAP" || {
+          curl -sL -H "X-Bypass: $CF_ALLOWED_TOKEN" "$SITEMAP_URL" -o "$TEMP_SITEMAP" || {
             echo "❌ Failed to download sitemap"
             exit 1
           }
@@ -55,6 +57,17 @@ jobs:
           head -n 40 "$TEMP_SITEMAP" | sed 's/^/    /'
           echo "---- end head ----"
           echo ""
+
+          # Detect Cloudflare challenge / block HTML and fail with guidance
+          if grep -qiE "Attention Required|Sorry, you have been blocked|cf-wrapper|enable_cookies|cloudflare" "$TEMP_SITEMAP"; then
+            echo "❌ Cloudflare challenge or block detected in downloaded content. The runner is being blocked."
+            echo "👉 Make an Allow rule in Cloudflare for the header X-Bypass (see repo secrets & cloudflare rule instructions)."
+            echo ""
+            echo "---- full head for debugging ----"
+            head -n 200 "$TEMP_SITEMAP" | sed 's/^/    /'
+            echo "---- end ----"
+            exit 1
+          fi
 
           # Aggregate <loc> entries. Handle sitemapindex (child .xml sitemaps) by fetching them.
           LOCS_TOP="$(mktemp)"
@@ -71,7 +84,7 @@ jobs:
               if echo "$sm" | grep -qiE '\.xml$'; then
                 echo "  ↳ fetching $sm"
                 child_tmp="$(mktemp)"
-                if curl -sL "$sm" -o "$child_tmp"; then
+                if curl -sL -H "X-Bypass: $CF_ALLOWED_TOKEN" "$sm" -o "$child_tmp"; then
                   sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' "$child_tmp" >> "$AGG" || true
                 else
                   echo "    ⚠️  Failed to fetch child sitemap $sm"
