@@ -1,13 +1,12 @@
 name: Sitemap Cache Warming
 
-# Allow this workflow to push the small state file back to the repo
 permissions:
   contents: write
 
 on:
   schedule:
     - cron: '0 */2 * * *'  # Every 2 hours
-  workflow_dispatch:  # Manual trigger button
+  workflow_dispatch:
 
 jobs:
   warm-cache:
@@ -28,82 +27,78 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
-          # Custom UA (do not include "curl" or other blocked tokens)
+          # Configuration
           CUSTOM_UA="shopsalesja-Cache-Warming-Bot/1.0"
-
           SITEMAP_URL="https://shopsalesja.com/sitemap.xml"
-          MAX_URLS_PER_RUN=5
-          FRESHNESS_DAYS=60
+          MAX_URLS_PER_RUN=10     # user requested
+          FRESHNESS_DAYS=60       # keep freshness at 60
           STATE_DIR="warming-state"
           STATE_FILE="$STATE_DIR/warming-state.txt"
           TEMP_SITEMAP="sitemap.tmp.xml"
 
           mkdir -p "$STATE_DIR"
-
-          # Ensure a placeholder state file exists so later steps / commits have something
-          if [ ! -f "$STATE_FILE" ]; then
-            echo "0" > "$STATE_FILE"
-          fi
+          if [ ! -f "$STATE_FILE" ]; then echo "0" > "$STATE_FILE"; fi
 
           echo "🔥 Starting sitemap cache warming..."
           echo ""
 
-          # Download sitemap (include bypass header + custom UA)
-          echo "📡 Fetching sitemap from $SITEMAP_URL..."
-          curl -sL -A "$CUSTOM_UA" -H "X-Bypass: $CF_ALLOWED_TOKEN" "$SITEMAP_URL" -o "$TEMP_SITEMAP" || {
-            echo "❌ Failed to download sitemap"
-            exit 1
+          # curl with retries + exponential backoff + small jitter for robustness
+          curl_with_retry() {
+            local url="$1" outfile="$2"
+            local max_attempts=3
+            local attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              if curl -sL -A "$CUSTOM_UA" -H "X-Bypass: $CF_ALLOWED_TOKEN" "$url" -o "$outfile"; then
+                return 0
+              fi
+              # backoff + jitter
+              sleep $(( (2 ** attempt) + (RANDOM % 3) ))
+              attempt=$((attempt + 1))
+            done
+            return 1
           }
 
-          # Debug: show head of sitemap to help troubleshooting
+          echo "📡 Fetching sitemap from $SITEMAP_URL..."
+          if ! curl_with_retry "$SITEMAP_URL" "$TEMP_SITEMAP"; then
+            echo "❌ Failed to download sitemap"
+            exit 1
+          fi
+
           echo "---- sitemap.tmp.xml head ----"
           head -n 40 "$TEMP_SITEMAP" | sed 's/^/    /'
           echo "---- end head ----"
           echo ""
 
-          # Precise detection: only treat as blocked HTML if it's NOT XML and contains Cloudflare challenge markers.
-          # First check if the file looks like XML (starts with <?xml or contains <urlset near top).
+          # Only treat as Cloudflare challenge if NOT XML and challenge markers present
           is_xml=0
-          if head -n 6 "$TEMP_SITEMAP" | grep -qi '<?xml'; then
-            is_xml=1
-          elif head -n 12 "$TEMP_SITEMAP" | grep -qi '<urlset'; then
-            is_xml=1
-          fi
+          if head -n 6 "$TEMP_SITEMAP" | grep -qi '<?xml'; then is_xml=1; fi
+          if head -n 12 "$TEMP_SITEMAP" | grep -qi '<urlset'; then is_xml=1; fi
 
           if [ "$is_xml" -eq 0 ]; then
-            # file does not look like XML — check for real Cloudflare challenge HTML markers
             matches=$(grep -niE "Attention Required|Sorry, you have been blocked|cf-wrapper|enable_cookies|Checking your browser|cf-browser-verification|id=\"challenge-form\"|__cf_chl_jschl_tk__|__cf_chl_" "$TEMP_SITEMAP" || true)
             if [ -n "$matches" ]; then
-              echo "❌ Cloudflare challenge or block detected in downloaded content. The runner is being blocked."
-              echo "👉 Make an Allow rule in Cloudflare for the header X-Bypass (see repo secrets & cloudflare rule instructions)."
-              echo ""
+              echo "❌ Cloudflare challenge detected — runner blocked"
               echo "Matching lines:"
               echo "$matches" | sed 's/^/    /'
               echo ""
-              echo "---- full head for debugging ----"
               head -n 200 "$TEMP_SITEMAP" | sed 's/^/    /'
-              echo "---- end ----"
               exit 1
             fi
-            # If not matching known challenge markers, continue (it might be normal HTML)
           fi
 
-          # Aggregate <loc> entries. Handle sitemapindex (child .xml sitemaps) by fetching them.
+          # Extract <loc> values and follow child sitemaps when present
           LOCS_TOP="$(mktemp)"
           AGG="$(mktemp)"
-          # Extract locs from top-level sitemap
           sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' "$TEMP_SITEMAP" > "$LOCS_TOP" || true
 
-          # If there are child sitemap .xml links, fetch them and aggregate their <loc>s
           if grep -qiE '\.xml$' "$LOCS_TOP"; then
-            echo "🔁 Found child sitemap(s); fetching and aggregating..."
+            echo "🔁 Found child sitemap(s); fetching child sitemaps..."
             while IFS= read -r sm; do
-              # skip empty lines
               [ -z "${sm// }" ] && continue
               if echo "$sm" | grep -qiE '\.xml$'; then
                 echo "  ↳ fetching $sm"
                 child_tmp="$(mktemp)"
-                if curl -sL -A "$CUSTOM_UA" -H "X-Bypass: $CF_ALLOWED_TOKEN" "$sm" -o "$child_tmp"; then
+                if curl_with_retry "$sm" "$child_tmp"; then
                   sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' "$child_tmp" >> "$AGG" || true
                 else
                   echo "    ⚠️  Failed to fetch child sitemap $sm"
@@ -111,23 +106,19 @@ jobs:
                 rm -f "$child_tmp"
               fi
             done < "$LOCS_TOP"
-            # Also add any non-xml locs that might be present in the top-level (rare)
+            # also include any non-xml locs from top-level (rare)
             grep -viE '\.xml$' "$LOCS_TOP" >> "$AGG" || true
           else
-            # No child sitemaps: use the locs from the one file
             cat "$LOCS_TOP" >> "$AGG" || true
           fi
 
-          # Prepare final URL list: normalize line endings and remove blanks
           URLS=$(cat "$AGG" | tr -d '\r' | sed '/^\s*$/d' || true)
-
-          # Cleanup temp files
           rm -f "$LOCS_TOP" "$AGG" || true
 
-          # Filter out typical asset extensions (images, css, js, pdf) but keep page HTML URLs
+          # Filter out common asset extensions
           URLS=$(echo "$URLS" | grep -viE '\.(xml|jpg|jpeg|png|gif|webp|css|js|pdf)$' || true)
 
-          # Normalize URLs to lowercase paths (align with Worker canonicalization)
+          # Normalize URL path segments to lowercase (keeps query/hash as-is)
           URLS=$(echo "$URLS" | awk '
           {
             line = $0
@@ -149,13 +140,9 @@ jobs:
             qPos = index(pathAndAfter, "?")
             hPos = index(pathAndAfter, "#")
             sepPos = 0
-            if (qPos > 0 && hPos > 0) {
-              sepPos = (qPos < hPos ? qPos : hPos)
-            } else if (qPos > 0) {
-              sepPos = qPos
-            } else if (hPos > 0) {
-              sepPos = hPos
-            }
+            if (qPos > 0 && hPos > 0) { sepPos = (qPos < hPos ? qPos : hPos) }
+            else if (qPos > 0) { sepPos = qPos }
+            else if (hPos > 0) { sepPos = hPos }
             if (sepPos > 0) {
               pathOnly = substr(pathAndAfter, 1, sepPos-1)
               tail = substr(pathAndAfter, sepPos)
@@ -167,11 +154,8 @@ jobs:
             newPath = ""
             for (i = 1; i <= length(segs); i++) {
               seg = segs[i]
-              if (i == 1) {
-                newPath = (seg == "" ? "/" : "/" tolower(seg))
-              } else {
-                newPath = newPath "/" tolower(seg)
-              }
+              if (i == 1) { newPath = (seg == "" ? "/" : "/" tolower(seg)) }
+              else { newPath = newPath "/" tolower(seg) }
             }
             gsub(/\/+/, "/", newPath)
             print proto "://" host newPath tail
@@ -186,34 +170,28 @@ jobs:
           echo "📋 Found $TOTAL_URLS URLs in sitemap (after filtering)"
           echo ""
 
-          # Load state from previous run (file is in repo after checkout)
+          # Load / validate state index
           if [ -f "$STATE_FILE" ]; then
             CURRENT_INDEX=$(cat "$STATE_FILE" | tr -d '\r\n' || echo "0")
             if ! [[ "$CURRENT_INDEX" =~ ^[0-9]+$ ]]; then
               echo "⚠️  Invalid state value in $STATE_FILE; resetting to 0"
               CURRENT_INDEX=0
-            else
-              echo "📍 Resuming from index $CURRENT_INDEX"
             fi
           else
             CURRENT_INDEX=0
-            echo "🆕 Starting new warming cycle"
           fi
-          echo ""
 
-          # Guard: if CURRENT_INDEX >= TOTAL_URLS reset to 0
           if [ "$CURRENT_INDEX" -ge "$TOTAL_URLS" ]; then
-            echo "🔄 Saved index beyond total URLs; resetting to 0"
             CURRENT_INDEX=0
           fi
 
-          # Select batch of URLs
+          # Pick batch
           START_LINE=$((CURRENT_INDEX + 1))
           BATCH_URLS=$(echo "$URLS" | tail -n +"$START_LINE" | head -n "$MAX_URLS_PER_RUN" || true)
           BATCH_COUNT=$(echo "$BATCH_URLS" | sed '/^\s*$/d' | wc -l | tr -d ' ')
 
           if [ -z "$BATCH_URLS" ] || [ "$BATCH_COUNT" -eq 0 ]; then
-            echo "🔄 Reached end of sitemap or no batch available, restarting from beginning"
+            echo "🔄 Reached end or no batch available. Restarting from beginning."
             CURRENT_INDEX=0
             START_LINE=1
             BATCH_URLS=$(echo "$URLS" | head -n "$MAX_URLS_PER_RUN")
@@ -223,21 +201,19 @@ jobs:
           echo "📦 Processing batch: URLs $START_LINE to $((CURRENT_INDEX + BATCH_COUNT)) of $TOTAL_URLS"
           echo ""
 
-          # Warm loop
-          WARMED=0
-          SKIPPED=0
-          FAILED=0
-          INDEX=0
-
-          # Precompute freshness threshold in seconds
+          # Counters for reporting
+          WARMED=0; SKIPPED=0; FAILED=0; INDEX=0
           FRESHNESS_THRESHOLD=$((FRESHNESS_DAYS * 86400))
+
+          # We'll accumulate simple diagnostics to show hits vs misses
+          EDGES_HIT=0; EDGES_MISS=0; TIERED_HIT=0; TIERED_MISS=0
 
           while IFS= read -r url; do
             url=$(echo "$url" | tr -d '\r')
             INDEX=$((INDEX + 1))
             echo "[$INDEX/$BATCH_COUNT] Checking: $url"
 
-            # HEAD request follow redirects (include UA + bypass header)
+            # HEAD: follow redirects, include UA + bypass header
             RESPONSE=$(curl -sI -L -A "$CUSTOM_UA" -H "X-Bypass: $CF_ALLOWED_TOKEN" -w "\n%{http_code}" "$url" 2>/dev/null || echo -e "\n000")
             HTTP_CODE=$(echo "$RESPONSE" | tail -n1 | tr -d '\r')
             HEADERS=$(echo "$RESPONSE" | sed '$d' || true)
@@ -246,35 +222,36 @@ jobs:
               echo "  ⚠️  Got HTTP $HTTP_CODE - skipping"
               FAILED=$((FAILED + 1))
               echo ""
+              sleep $((2 + RANDOM % 4))
               continue
             fi
 
-            # Extract Age and CF-Cache-Status from headers (case-insensitive)
+            # Extract Age, cf-cache-status and tiered status
             AGE=$(echo "$HEADERS" | awk 'BEGIN{IGNORECASE=1} /^age:/{print $2; exit}' | tr -d '\r' || echo "0")
             CACHE_STATUS=$(echo "$HEADERS" | awk 'BEGIN{IGNORECASE=1} /^cf-cache-status:/{print $2; exit}' | tr -d '\r' || echo "MISS")
+            TIERED_STATUS=$(echo "$HEADERS" | awk 'BEGIN{IGNORECASE=1} /^cf-cache-tiered-status:/{print $2; exit}' | tr -d '\r' || echo "MISS")
+
+            # Track diagnostics
+            if [ "${CACHE_STATUS^^}" = "HIT" ]; then EDGES_HIT=$((EDGES_HIT + 1)); else EDGES_MISS=$((EDGES_MISS + 1)); fi
+            if [ "${TIERED_STATUS^^}" = "HIT" ] || [ "${TIERED_STATUS^^}" = "REVALIDATED" ]; then TIERED_HIT=$((TIERED_HIT + 1)); else TIERED_MISS=$((TIERED_MISS + 1)); fi
 
             if ! [[ "$AGE" =~ ^[0-9]+$ ]]; then AGE=0; fi
             AGE_DAYS=$((AGE / 86400))
 
-            # Skip if fresh
-            if [ "${CACHE_STATUS^^}" = "HIT" ] && [ "$AGE" -lt "$FRESHNESS_THRESHOLD" ]; then
-              echo "  ⏭️  Skipping (edge HIT, ${AGE_DAYS}d old)"
+            # Skip when Edge is HIT, Age < threshold AND tiered status is not MISS (i.e. tiered has it)
+            if [ "${CACHE_STATUS^^}" = "HIT" ] && [ "$AGE" -lt "$FRESHNESS_THRESHOLD" ] && [ "${TIERED_STATUS^^}" != "MISS" ]; then
+              echo "  ⏭️  Skipping (Edge+Tiered HIT, ${AGE_DAYS}d old)"
               SKIPPED=$((SKIPPED + 1))
               echo ""
+              sleep $((2 + RANDOM % 4))
               continue
             fi
 
-            # Warm the URL
-            echo "  🔥 Warming ($CACHE_STATUS, ${AGE_DAYS}d old)..."
-
-            WARM_RESPONSE=$(curl -sL \
-              -A "$CUSTOM_UA" \
-              -H "X-Bypass: $CF_ALLOWED_TOKEN" \
+            # Warm the URL (GET) to populate cache layers
+            echo "  🔥 Warming (was ${CACHE_STATUS}, ${AGE_DAYS}d old)..."
+            WARM_RESPONSE=$(curl -sL -A "$CUSTOM_UA" -H "X-Bypass: $CF_ALLOWED_TOKEN" \
               -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
-              -H "Accept-Language: en-US,en;q=0.9" \
-              -w "\n%{http_code}" \
-              "$url" 2>/dev/null || echo -e "\n000")
-
+              -H "Accept-Language: en-US,en;q=0.9" -w "\n%{http_code}" "$url" 2>/dev/null || echo -e "\n000")
             WARM_CODE=$(echo "$WARM_RESPONSE" | tail -n1 | tr -d '\r')
 
             if [ "$WARM_CODE" = "200" ]; then
@@ -286,19 +263,16 @@ jobs:
             fi
 
             echo ""
-            sleep 2  # Delay between requests
+            # jittered sleep between requests to avoid burstiness
+            sleep $((2 + RANDOM % 4))
           done <<< "$BATCH_URLS"
 
-          # Update state for next run
+          # update state file
           NEXT_INDEX=$((CURRENT_INDEX + BATCH_COUNT))
-
-          if [ "$NEXT_INDEX" -ge "$TOTAL_URLS" ]; then
-            echo "🔄 Completed full cycle, restarting"
-            NEXT_INDEX=0
-          fi
-
+          if [ "$NEXT_INDEX" -ge "$TOTAL_URLS" ]; then NEXT_INDEX=0; fi
           echo "$NEXT_INDEX" > "$STATE_FILE"
 
+          # Final summary and diagnostics
           echo ""
           echo "📊 Results:"
           echo "   ✅ Warmed: $WARMED"
@@ -307,23 +281,10 @@ jobs:
           echo ""
           echo "📍 Next run will start from index $NEXT_INDEX of $TOTAL_URLS"
           echo ""
+          echo "🧾 Cache diagnostics (this run batch only):"
+          echo "   Edge HITs: $EDGES_HIT"
+          echo "   Edge MISSes: $EDGES_MISS"
+          echo "   Tiered HITs: $TIERED_HIT"
+          echo "   Tiered MISSes: $TIERED_MISS"
+          echo ""
           echo "✅ Cache warming complete!"
-
-      - name: Commit and push state file
-        if: always()
-        run: |
-          # Configure git author (Actions bot)
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Stage the state file (no-op if missing)
-          git add warming-state/warming-state.txt || true
-
-          # Only commit when there are changes
-          if git diff --staged --quiet; then
-            echo "No state changes to commit"
-          else
-            git commit -m "Update warming-state: next_index=$(cat warming-state/warming-state.txt)"
-            # push back to the same branch the workflow was triggered on
-            git push origin "HEAD:${GITHUB_REF#refs/heads/}"
-          fi
