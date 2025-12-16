@@ -1,0 +1,67 @@
+name: Monthly Cache Reserve Fill
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'   # 00:00 UTC on the 1st of each month
+  workflow_dispatch:
+
+jobs:
+  reserve-fill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CF_ALLOWED_TOKEN: ${{ secrets.CF_ALLOWED_TOKEN }}
+
+    steps:
+      - name: Monthly Cache Reserve Fill
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          CUSTOM_UA="shopsalesja-Cache-Warming-Bot/1.0"
+          CF_TOKEN="$CF_ALLOWED_TOKEN"
+          TMP_LIST="$(mktemp)"
+          SAMPLE=10   # how many to sample for quick pre/post checks
+          RESERVE_COUNT=20
+
+          echo "📅 MONTHLY: Testing cache-reserve status for https://shopsalesja.com/"
+          # HEAD test to see current cache headers
+          echo "---- Pre-check HEAD ----"
+          curl -sI -A "$CUSTOM_UA" -H "X-Bypass: $CF_TOKEN" "https://shopsalesja.com/" | grep -i "cf-cache-status\|cf-cache-tiered-status\|age" || true
+          echo "---- end pre-check ----"
+          echo ""
+
+          echo "📡 Fetching sitemap and preparing top $RESERVE_COUNT URLs"
+          curl -sL -A "$CUSTOM_UA" -H "X-Bypass: $CF_TOKEN" "https://shopsalesja.com/sitemap.xml" \
+            | sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' \
+            | grep -viE '\.(xml|jpg|jpeg|png|gif|webp|css|js|pdf)$' \
+            | head -n "$RESERVE_COUNT" > "$TMP_LIST"
+
+          echo "🔁 Populating all cache layers for $RESERVE_COUNT URLs"
+          COUNT=0
+          while IFS= read -r url; do
+            COUNT=$((COUNT + 1))
+            echo "[$COUNT/$RESERVE_COUNT] GET $url"
+            curl -sL -A "$CUSTOM_UA" -H "X-Bypass: $CF_TOKEN" "$url" > /dev/null || echo "  ⚠️  request failed"
+            sleep 3
+          done < "$TMP_LIST"
+
+          echo ""
+          echo "---- Post-check HEAD ----"
+          curl -sI -A "$CUSTOM_UA" -H "X-Bypass: $CF_TOKEN" "https://shopsalesja.com/" | grep -i "cf-cache-status\|cf-cache-tiered-status\|age" || true
+          echo "---- end post-check ----"
+          echo ""
+
+          # Optional quick sample validation of a few reserve URLs
+          echo "🔍 Sample HEAD checks for first $SAMPLE URLs from the reserve"
+          head -n "$SAMPLE" "$TMP_LIST" | nl -ba | while IFS=$'\t' read -r n url; do
+            echo "[$n] $url"
+            curl -sI -A "$CUSTOM_UA" -H "X-Bypass: $CF_TOKEN" "$url" | grep -i "cf-cache-status\|cf-cache-tiered-status\|age" || echo "  No cache headers"
+            echo ""
+          done
+
+          rm -f "$TMP_LIST"
+          echo "✅ Monthly cache reserve fill complete"
