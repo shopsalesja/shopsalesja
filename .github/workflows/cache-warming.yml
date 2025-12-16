@@ -14,6 +14,7 @@ jobs:
     timeout-minutes: 30
     env:
       CF_ALLOWED_TOKEN: ${{ secrets.CF_ALLOWED_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout (needed so we can read/write the state file)
@@ -72,7 +73,6 @@ jobs:
             while [ $attempt -le $max_attempts ]; do
               out=$(curl -S -sI -L -A "$CUSTOM_UA" -H "X-Bypass: $CF_ALLOWED_TOKEN" \
                 --connect-timeout $CONNECT_TIMEOUT --max-time $MAX_TIME_HEAD -w "\n%{http_code}" "$url" 2>&1) || out="$out"
-              # if out ends with 3-digit status code, return it
               code=$(echo "$out" | tail -n1 | tr -d '\r')
               if [[ "$code" =~ ^[0-9]{3}$ ]]; then
                 echo "$out"
@@ -82,12 +82,11 @@ jobs:
               sleep $(( (2 ** attempt) + (RANDOM % 2) ))
               attempt=$((attempt + 1))
             done
-            # last attempt may return something; echo it so caller can inspect
-            echo "${out:-}" 
+            echo "${out:-}"
             return 1
           }
 
-          # GET request wrapper with retries & timeouts; returns HTTP code on last line if available
+          # GET request wrapper with retries & timeouts; returns output (last line should be status)
           curl_get() {
             local url="$1"
             local max_attempts=2
@@ -347,3 +346,52 @@ jobs:
           echo "   Tiered MISSes: $TIERED_MISS"
           echo ""
           echo "✅ Cache warming complete!"
+
+      - name: Commit and push state file (robust)
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "State file (to commit):"
+          cat warming-state/warming-state.txt || true
+
+          git add warming-state/warming-state.txt || true
+
+          if git diff --cached --quiet; then
+            echo "No state changes to commit"
+            exit 0
+          fi
+
+          git commit -m "Update warming-state: next_index=$(cat warming-state/warming-state.txt)"
+
+          echo "Attempting git push to ${GITHUB_REF#refs/heads/}..."
+          if git push origin "HEAD:${GITHUB_REF#refs/heads/}"; then
+            echo "git push succeeded"
+            exit 0
+          fi
+
+          echo "git push failed — falling back to GitHub Contents API using GITHUB_TOKEN"
+
+          owner_repo="$GITHUB_REPOSITORY"
+          branch="${GITHUB_REF#refs/heads/}"
+          file_path="warming-state/warming-state.txt"
+
+          # Get current file SHA so we can update
+          sha=$(curl -s -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$owner_repo/contents/$file_path?ref=$branch" | grep '"sha":' | head -n1 | sed -E 's/.*"sha":\s*"([^"]+)".*/\1/')
+
+          content_b64=$(base64 -w 0 "$file_path")
+          msg=$(printf 'Update warming-state: next_index=%s' "$(cat $file_path)")
+          payload=$(printf '{"message":"%s","content":"%s","sha":"%s","branch":"%s"}' "$msg" "$content_b64" "$sha" "$branch")
+
+          resp=$(curl -s -X PUT -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$owner_repo/contents/$file_path" -d "$payload")
+          echo "GitHub API response: $resp"
+
+          if echo "$resp" | grep -q '"content":'; then
+            echo "State file updated via API successfully"
+            exit 0
+          fi
+
+          echo "Failed to update state file via API"
+          exit 1
