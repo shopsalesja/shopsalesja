@@ -28,6 +28,9 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
+          # Custom UA (do not include "curl" or other blocked tokens)
+          CUSTOM_UA="shopsalesja-Cache-Warming-Bot/1.0"
+
           SITEMAP_URL="https://shopsalesja.com/sitemap.xml"
           MAX_URLS_PER_RUN=5
           FRESHNESS_DAYS=60
@@ -45,9 +48,9 @@ jobs:
           echo "🔥 Starting sitemap cache warming..."
           echo ""
 
-          # Download sitemap (include bypass header)
+          # Download sitemap (include bypass header + custom UA)
           echo "📡 Fetching sitemap from $SITEMAP_URL..."
-          curl -sL -H "X-Bypass: $CF_ALLOWED_TOKEN" "$SITEMAP_URL" -o "$TEMP_SITEMAP" || {
+          curl -sL -A "$CUSTOM_UA" -H "X-Bypass: $CF_ALLOWED_TOKEN" "$SITEMAP_URL" -o "$TEMP_SITEMAP" || {
             echo "❌ Failed to download sitemap"
             exit 1
           }
@@ -59,9 +62,13 @@ jobs:
           echo ""
 
           # Detect Cloudflare challenge / block HTML and fail with guidance
-          if grep -qiE "Attention Required|Sorry, you have been blocked|cf-wrapper|enable_cookies|cloudflare" "$TEMP_SITEMAP"; then
+          matches=$(grep -niE "Attention Required|Sorry, you have been blocked|cf-wrapper|enable_cookies|cloudflare" "$TEMP_SITEMAP" || true)
+          if [ -n "$matches" ]; then
             echo "❌ Cloudflare challenge or block detected in downloaded content. The runner is being blocked."
             echo "👉 Make an Allow rule in Cloudflare for the header X-Bypass (see repo secrets & cloudflare rule instructions)."
+            echo ""
+            echo "Matching lines:"
+            echo "$matches" | sed 's/^/    /'
             echo ""
             echo "---- full head for debugging ----"
             head -n 200 "$TEMP_SITEMAP" | sed 's/^/    /'
@@ -84,7 +91,7 @@ jobs:
               if echo "$sm" | grep -qiE '\.xml$'; then
                 echo "  ↳ fetching $sm"
                 child_tmp="$(mktemp)"
-                if curl -sL -H "X-Bypass: $CF_ALLOWED_TOKEN" "$sm" -o "$child_tmp"; then
+                if curl -sL -A "$CUSTOM_UA" -H "X-Bypass: $CF_ALLOWED_TOKEN" "$sm" -o "$child_tmp"; then
                   sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' "$child_tmp" >> "$AGG" || true
                 else
                   echo "    ⚠️  Failed to fetch child sitemap $sm"
@@ -218,8 +225,8 @@ jobs:
             INDEX=$((INDEX + 1))
             echo "[$INDEX/$BATCH_COUNT] Checking: $url"
 
-            # HEAD request follow redirects
-            RESPONSE=$(curl -sI -L -w "\n%{http_code}" "$url" 2>/dev/null || echo -e "\n000")
+            # HEAD request follow redirects (include UA + bypass header)
+            RESPONSE=$(curl -sI -L -A "$CUSTOM_UA" -H "X-Bypass: $CF_ALLOWED_TOKEN" -w "\n%{http_code}" "$url" 2>/dev/null || echo -e "\n000")
             HTTP_CODE=$(echo "$RESPONSE" | tail -n1 | tr -d '\r')
             HEADERS=$(echo "$RESPONSE" | sed '$d' || true)
 
@@ -249,7 +256,8 @@ jobs:
             echo "  🔥 Warming ($CACHE_STATUS, ${AGE_DAYS}d old)..."
 
             WARM_RESPONSE=$(curl -sL \
-              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              -A "$CUSTOM_UA" \
+              -H "X-Bypass: $CF_ALLOWED_TOKEN" \
               -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
               -H "Accept-Language: en-US,en;q=0.9" \
               -w "\n%{http_code}" \
