@@ -61,19 +61,31 @@ jobs:
           echo "---- end head ----"
           echo ""
 
-          # Detect Cloudflare challenge / block HTML and fail with guidance
-          matches=$(grep -niE "Attention Required|Sorry, you have been blocked|cf-wrapper|enable_cookies|cloudflare" "$TEMP_SITEMAP" || true)
-          if [ -n "$matches" ]; then
-            echo "❌ Cloudflare challenge or block detected in downloaded content. The runner is being blocked."
-            echo "👉 Make an Allow rule in Cloudflare for the header X-Bypass (see repo secrets & cloudflare rule instructions)."
-            echo ""
-            echo "Matching lines:"
-            echo "$matches" | sed 's/^/    /'
-            echo ""
-            echo "---- full head for debugging ----"
-            head -n 200 "$TEMP_SITEMAP" | sed 's/^/    /'
-            echo "---- end ----"
-            exit 1
+          # Precise detection: only treat as blocked HTML if it's NOT XML and contains Cloudflare challenge markers.
+          # First check if the file looks like XML (starts with <?xml or contains <urlset near top).
+          is_xml=0
+          if head -n 6 "$TEMP_SITEMAP" | grep -qi '<?xml'; then
+            is_xml=1
+          elif head -n 12 "$TEMP_SITEMAP" | grep -qi '<urlset'; then
+            is_xml=1
+          fi
+
+          if [ "$is_xml" -eq 0 ]; then
+            # file does not look like XML — check for real Cloudflare challenge HTML markers
+            matches=$(grep -niE "Attention Required|Sorry, you have been blocked|cf-wrapper|enable_cookies|Checking your browser|cf-browser-verification|id=\"challenge-form\"|__cf_chl_jschl_tk__|__cf_chl_" "$TEMP_SITEMAP" || true)
+            if [ -n "$matches" ]; then
+              echo "❌ Cloudflare challenge or block detected in downloaded content. The runner is being blocked."
+              echo "👉 Make an Allow rule in Cloudflare for the header X-Bypass (see repo secrets & cloudflare rule instructions)."
+              echo ""
+              echo "Matching lines:"
+              echo "$matches" | sed 's/^/    /'
+              echo ""
+              echo "---- full head for debugging ----"
+              head -n 200 "$TEMP_SITEMAP" | sed 's/^/    /'
+              echo "---- end ----"
+              exit 1
+            fi
+            # If not matching known challenge markers, continue (it might be normal HTML)
           fi
 
           # Aggregate <loc> entries. Handle sitemapindex (child .xml sitemaps) by fetching them.
