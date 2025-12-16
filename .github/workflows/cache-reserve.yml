@@ -16,7 +16,7 @@ jobs:
       CF_ALLOWED_TOKEN: ${{ secrets.CF_ALLOWED_TOKEN }}
 
     steps:
-      - name: Monthly Cache Reserve Fill
+      - name: Monthly Cache Reserve Fill (rotating selection)
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
@@ -24,11 +24,12 @@ jobs:
           CUSTOM_UA="shopsalesja-Cache-Warming-Bot/1.0"
           CF_TOKEN="$CF_ALLOWED_TOKEN"
           TMP_LIST="$(mktemp)"
+          ALL_LIST="$(mktemp)"
           SAMPLE=10   # how many to sample for quick pre/post checks
           RESERVE_COUNT=20
 
-          # ensure temp file is cleaned up on exit
-          trap 'rm -f "$TMP_LIST"' EXIT
+          # ensure temp files are cleaned up on exit
+          trap 'rm -f "$TMP_LIST" "$ALL_LIST"' EXIT
 
           echo "📅 MONTHLY: Testing cache-reserve status for https://shopsalesja.com/"
           # HEAD test to see current cache headers
@@ -37,25 +38,65 @@ jobs:
           echo "---- end pre-check ----"
           echo ""
 
-          echo "📡 Fetching sitemap and preparing top $RESERVE_COUNT URLs"
-          # tolerate broken pipe from head/grep by allowing non-zero exit
+          echo "📡 Fetching sitemap and building full URL list"
+          # build full list (allow broken pipe downstream)
           curl -sL -A "$CUSTOM_UA" -H "X-Bypass: $CF_TOKEN" "https://shopsalesja.com/sitemap.xml" \
             | sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' \
-            | grep -viE '\.(xml|jpg|jpeg|png|gif|webp|css|js|pdf)$' \
-            | head -n "$RESERVE_COUNT" > "$TMP_LIST" || true
+            | grep -viE '\.(xml|jpg|jpeg|png|gif|webp|css|js|pdf)$' > "$ALL_LIST" || true
 
-          # If no URLs found, exit gracefully
-          if [ ! -s "$TMP_LIST" ]; then
-            echo "⚠️  No reserve URLs found — exiting."
+          # Count total URLs
+          TOTAL=$(wc -l < "$ALL_LIST" | tr -d ' ')
+          if [ -z "$TOTAL" ] || [ "$TOTAL" -eq 0 ]; then
+            echo "⚠️  No URLs found in sitemap — exiting."
             exit 0
           fi
 
-          echo "🔁 Populating all cache layers for $RESERVE_COUNT URLs"
+          echo "Found $TOTAL candidate URLs in sitemap"
+
+          # Compute rotating offset based on months since epoch so selection shifts each month
+          YEAR=$(date -u +%Y)
+          MONTH_NUM=$(date -u +%m)
+          # Avoid octal interpretation by forcing base-10
+          MONTH_INDEX=$((10#$MONTH_NUM - 1))  # 0..11
+          # months since 1970-01
+          months_since_epoch=$(( (YEAR - 1970) * 12 + MONTH_INDEX ))
+          OFFSET=$(( (months_since_epoch * RESERVE_COUNT) % TOTAL ))
+          echo "Selecting $RESERVE_COUNT URLs starting at offset $OFFSET (months_since_epoch=$months_since_epoch)"
+
+          # Build rotated selection into TMP_LIST (wrap if needed)
+          if [ "$TOTAL" -le "$RESERVE_COUNT" ]; then
+            # fewer URLs than reserve count - use them all
+            cp "$ALL_LIST" "$TMP_LIST"
+          else
+            start_line=$((OFFSET + 1))
+            end_line=$((OFFSET + RESERVE_COUNT))
+            if [ "$end_line" -le "$TOTAL" ]; then
+              # contiguous slice
+              tail -n +"$start_line" "$ALL_LIST" | head -n "$RESERVE_COUNT" > "$TMP_LIST"
+            else
+              # wrap-around: take tail from start_line..end and then head from start
+              tail -n +"$start_line" "$ALL_LIST" > "${TMP_LIST}.part1"
+              take_from_start=$((RESERVE_COUNT - (TOTAL - OFFSET)))
+              head -n "$take_from_start" "$ALL_LIST" > "${TMP_LIST}.part2"
+              cat "${TMP_LIST}.part1" "${TMP_LIST}.part2" > "$TMP_LIST"
+              rm -f "${TMP_LIST}.part1" "${TMP_LIST}.part2"
+            fi
+          fi
+
+          # Final guard
+          if [ ! -s "$TMP_LIST" ]; then
+            echo "⚠️  No reserve URLs selected — exiting."
+            exit 0
+          fi
+
+          echo "🔁 Populating cache layers for $(wc -l < "$TMP_LIST" | tr -d ' ') URLs (rotating selection)"
           COUNT=0
           while IFS= read -r url; do
             COUNT=$((COUNT + 1))
-            echo "[$COUNT/$RESERVE_COUNT] GET $url"
-            curl -sL -A "$CUSTOM_UA" -H "X-Bypass: $CF_TOKEN" "$url" > /dev/null || echo "  ⚠️  request failed"
+            echo "[$COUNT] GET $url"
+            # GET to populate cache layers; continue on failures
+            curl -sL -A "$CUSTOM_UA" -H "X-Bypass: $CF_TOKEN" "$url" > /dev/null || echo "  ⚠️  request failed for $url"
+            # small delay to avoid bursts
             sleep 3
           done < "$TMP_LIST"
 
@@ -65,12 +106,12 @@ jobs:
           echo "---- end post-check ----"
           echo ""
 
-          # Optional quick sample validation of a few reserve URLs
-          echo "🔍 Sample HEAD checks for first $SAMPLE URLs from the reserve"
+          # Optional quick sample validation of a few reserve URLs (first SAMPLE from the rotated list)
+          echo "🔍 Sample HEAD checks for first $SAMPLE URLs from the rotated reserve"
           head -n "$SAMPLE" "$TMP_LIST" | nl -ba | while IFS=$'\t' read -r n url; do
             echo "[$n] $url"
             curl -sI -A "$CUSTOM_UA" -H "X-Bypass: $CF_TOKEN" "$url" | grep -i "cf-cache-status\|cf-cache-tiered-status\|age" || echo "  No cache headers"
             echo ""
           done
 
-          echo "✅ Monthly cache reserve fill complete"
+          echo "✅ Monthly rotating cache reserve fill complete"
