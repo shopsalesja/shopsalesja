@@ -27,6 +27,9 @@ jobs:
           SAMPLE=10   # how many to sample for quick pre/post checks
           RESERVE_COUNT=20
 
+          # ensure temp file is cleaned up on exit
+          trap 'rm -f "$TMP_LIST"' EXIT
+
           echo "📅 MONTHLY: Testing cache-reserve status for https://shopsalesja.com/"
           # HEAD test to see current cache headers
           echo "---- Pre-check HEAD ----"
@@ -35,10 +38,17 @@ jobs:
           echo ""
 
           echo "📡 Fetching sitemap and preparing top $RESERVE_COUNT URLs"
+          # tolerate broken pipe from head/grep by allowing non-zero exit
           curl -sL -A "$CUSTOM_UA" -H "X-Bypass: $CF_TOKEN" "https://shopsalesja.com/sitemap.xml" \
             | sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' \
             | grep -viE '\.(xml|jpg|jpeg|png|gif|webp|css|js|pdf)$' \
-            | head -n "$RESERVE_COUNT" > "$TMP_LIST"
+            | head -n "$RESERVE_COUNT" > "$TMP_LIST" || true
+
+          # If no URLs found, exit gracefully
+          if [ ! -s "$TMP_LIST" ]; then
+            echo "⚠️  No reserve URLs found — exiting."
+            exit 0
+          fi
 
           echo "🔁 Populating all cache layers for $RESERVE_COUNT URLs"
           COUNT=0
@@ -63,5 +73,4 @@ jobs:
             echo ""
           done
 
-          rm -f "$TMP_LIST"
           echo "✅ Monthly cache reserve fill complete"
