@@ -1,5 +1,9 @@
 name: Sitemap Cache Warming
 
+# Allow this workflow to push the small state file back to the repo
+permissions:
+  contents: write
+
 on:
   schedule:
     - cron: '0 */2 * * *'  # Every 2 hours
@@ -11,15 +15,11 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout (optional, useful for logs)
+      - name: Checkout (needed so we can read/write the state file)
         uses: actions/checkout@v4
-
-      - name: Load previous state
-        uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
-          name: warming-state
-          path: warming-state
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Fetch and warm entire sitemap
         run: |
@@ -34,6 +34,11 @@ jobs:
           TEMP_SITEMAP="sitemap.tmp.xml"
 
           mkdir -p "$STATE_DIR"
+
+          # Ensure a placeholder state file exists so later steps / commits have something
+          if [ ! -f "$STATE_FILE" ]; then
+            echo "0" > "$STATE_FILE"
+          fi
 
           echo "🔥 Starting sitemap cache warming..."
           echo ""
@@ -68,33 +73,25 @@ jobs:
           # Normalize CRLF and remove empty lines
           URLS=$(echo "$URLS" | tr -d '\r' | sed '/^\s*$/d' || true)
 
-          # 🔥 Normalize URLs to lowercase paths (align with Worker canonicalization)
-          # This lowercases only the path portion, preserving query strings and fragments.
+          # Normalize URLs to lowercase paths (align with Worker canonicalization)
           URLS=$(echo "$URLS" | awk '
           {
             line = $0
-            # if no "://" present, just print original
             if (index(line, "://") == 0) { print line; next }
             split(line, protoSplit, "://")
             proto = protoSplit[1]
             rest = protoSplit[2]
-
-            # Extract host (up to first "/") and remainder
             host = rest
             pathAndAfter = ""
             slashPos = index(rest, "/")
             if (slashPos > 0) {
               host = substr(rest, 1, slashPos-1)
-              pathAndAfter = substr(rest, slashPos)  # includes leading "/"
+              pathAndAfter = substr(rest, slashPos)
             }
-
             if (pathAndAfter == "") {
-              # no path; print as-is (host only)
               print proto "://" host
               next
             }
-
-            # Separate path from query/fragment
             qPos = index(pathAndAfter, "?")
             hPos = index(pathAndAfter, "#")
             sepPos = 0
@@ -105,7 +102,6 @@ jobs:
             } else if (hPos > 0) {
               sepPos = hPos
             }
-
             if (sepPos > 0) {
               pathOnly = substr(pathAndAfter, 1, sepPos-1)
               tail = substr(pathAndAfter, sepPos)
@@ -113,23 +109,17 @@ jobs:
               pathOnly = pathAndAfter
               tail = ""
             }
-
-            # Lowercase each path segment
             split(pathOnly, segs, "/")
             newPath = ""
             for (i = 1; i <= length(segs); i++) {
               seg = segs[i]
-              # preserve empty segments (leading slash)
               if (i == 1) {
                 newPath = (seg == "" ? "/" : "/" tolower(seg))
               } else {
                 newPath = newPath "/" tolower(seg)
               }
             }
-
-            # Avoid double slashes produced above when pathOnly == "/"
             gsub(/\/+/, "/", newPath)
-
             print proto "://" host newPath tail
           }' || true)
 
@@ -142,7 +132,7 @@ jobs:
           echo "📋 Found $TOTAL_URLS URLs in sitemap (after filtering)"
           echo ""
 
-          # Load state from previous run (expects warming-state/warming-state.txt if artifact existed)
+          # Load state from previous run (file is in repo after checkout)
           if [ -f "$STATE_FILE" ]; then
             CURRENT_INDEX=$(cat "$STATE_FILE" | tr -d '\r\n' || echo "0")
             if ! [[ "$CURRENT_INDEX" =~ ^[0-9]+$ ]]; then
@@ -164,7 +154,6 @@ jobs:
           fi
 
           # Select batch of URLs
-          # tail -n +N starts from line N (1-based)
           START_LINE=$((CURRENT_INDEX + 1))
           BATCH_URLS=$(echo "$URLS" | tail -n +"$START_LINE" | head -n "$MAX_URLS_PER_RUN" || true)
           BATCH_COUNT=$(echo "$BATCH_URLS" | sed '/^\s*$/d' | wc -l | tr -d ' ')
@@ -210,9 +199,7 @@ jobs:
             AGE=$(echo "$HEADERS" | awk 'BEGIN{IGNORECASE=1} /^age:/{print $2; exit}' | tr -d '\r' || echo "0")
             CACHE_STATUS=$(echo "$HEADERS" | awk 'BEGIN{IGNORECASE=1} /^cf-cache-status:/{print $2; exit}' | tr -d '\r' || echo "MISS")
 
-            # Normalize AGE to integer seconds
             if ! [[ "$AGE" =~ ^[0-9]+$ ]]; then AGE=0; fi
-
             AGE_DAYS=$((AGE / 86400))
 
             # Skip if fresh
@@ -266,10 +253,22 @@ jobs:
           echo "📍 Next run will start from index $NEXT_INDEX of $TOTAL_URLS"
           echo ""
           echo "✅ Cache warming complete!"
-      - name: Save state for next run
-        uses: actions/upload-artifact@v4
+
+      - name: Commit and push state file
         if: always()
-        with:
-          name: warming-state
-          path: warming-state
-          retention-days: 7
+        run: |
+          # Configure git author (Actions bot)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Stage the state file (no-op if missing)
+          git add warming-state/warming-state.txt || true
+
+          # Only commit when there are changes
+          if git diff --staged --quiet; then
+            echo "No state changes to commit"
+          else
+            git commit -m "Update warming-state: next_index=$(cat warming-state/warming-state.txt)"
+            # push back to the same branch the workflow was triggered on
+            git push origin "HEAD:${GITHUB_REF#refs/heads/}"
+          fi
