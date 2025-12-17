@@ -1,4 +1,4 @@
-name: Sitemap Cache Warming
+name: Link My Site Categories Cache Warming
 
 permissions:
   contents: write
