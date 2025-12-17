@@ -34,7 +34,7 @@ jobs:
           MAX_URLS_PER_RUN=11
           FRESHNESS_DAYS=60
           STATE_DIR="warming-state"
-          STATE_FILE="$STATE_DIR/warming-state.txt"
+          STATE_FILE="$STATE_DIR/categories-warming-state.txt"
           TEMP_SITEMAP="sitemap.tmp.xml"
 
           # Curl timeouts (seconds)
