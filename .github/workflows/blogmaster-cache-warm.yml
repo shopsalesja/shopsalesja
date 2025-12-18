@@ -31,7 +31,7 @@ jobs:
           # Configuration
           CUSTOM_UA="shopsalesja-Cache-Warming-Bot/1.0"
           SITEMAP_URL="https://blogmaster.shopsalesja.com/sitemap.xml"
-          MAX_URLS_PER_RUN=10
+          MAX_URLS_PER_RUN=12
           FRESHNESS_DAYS=60
           STATE_DIR="warming-state"
           STATE_FILE="$STATE_DIR/blogmaster-warming-state.txt"
