@@ -10,6 +10,8 @@ ShopSalesJA is an online marketplace and directory that highlights the best Jama
 
 Visit the live site here: [https://shopsalesja.com](https://shopsalesja.com)
 https://shopsalesja.com/write-for-us
+https://shopsalesja.com/products/cloudflare-performance-pro-for-ecwid-max-cache-hit-rate-p804925616
+https://shopsalesja.com/products/How-I-Cut-My-Ecwid-Store-Initial-Load-To-Under-200ms-ttfb-And-Survived-An-Outage-c193600248
 
 https://linkmysite.app
 https://shopsalesja.com/products/Where-to-Buy-Gift-Cards-in-Jamaica-Local-And-Online-Options-c182867251
