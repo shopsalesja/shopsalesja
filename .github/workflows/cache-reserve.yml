@@ -5,7 +5,7 @@ permissions:
 
 on:
   schedule:
-    - cron: '0 0 1 * *'   # 00:00 UTC on the 1st of each month
+    - cron:
   workflow_dispatch:
 
 jobs:
