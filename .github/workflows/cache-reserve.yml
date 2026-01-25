@@ -11,7 +11,7 @@ on:
 jobs:
   reserve-fill:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes:
     env:
       CF_ALLOWED_TOKEN: ${{ secrets.CF_ALLOWED_TOKEN }}
 
